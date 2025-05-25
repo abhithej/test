@@ -1,0 +1,1593 @@
+create or replace PACKAGE BODY      xx_ar_email_pkg
+AS
+
+  g_package_name varchar2 (100) 	   := 'xx_ar_email_pkg';
+
+  g_confirmations varchar2 (100)       := ','||fnd_profile.value ('XX_ONT_EMAIL_CONFIRMATIONS');
+
+  g_confirmations_no_comma varchar2 (100)	:= fnd_profile.value ('XX_ONT_EMAIL_CONFIRMATIONS');
+
+  g_amount_format varchar2 (100) := '$999,999,990.99';
+  g_unit_price_format varchar2 (100) := '$999,999,990.9999';
+  g_date_format varchar2 (100) := 'DD Mon YYYY';
+  g_datetime_format varchar2 (100) := 'DD Mon YYYY HH:MI AM';
+
+  g_output_clob clob := null;
+
+
+procedure print_output (p_which in number, p_buff in varchar2, p_newline in varchar2 default 'Y') is
+begin
+	if fnd_global.conc_request_id > 0
+	then
+		if (p_newline = 'Y')
+		then
+			fnd_file.put_line (p_which, p_buff);
+		else
+			fnd_file.put (p_which, p_buff);
+		end if;
+	else
+		if (p_which = fnd_file.output)
+		then
+			g_output_clob := g_output_clob || p_buff;
+		end if;
+	end if;
+end;
+
+procedure print_output (p_which in number, p_buff in clob) is
+	l_chunks number := 0;
+	i number;
+begin
+
+  IF p_buff is null THEN
+    null;  -- fix production issue from 08-JUN-2016 returning PL/SQL: numeric or value error -- BMW
+  ELSE
+
+    -- print 100 at a time
+	l_chunks := ceil (length (p_buff)/100);
+
+	for i in 1..l_chunks
+	loop
+		if (i < l_chunks)
+		then
+			print_output (p_which, substr (p_buff, ((i-1)*100) + 1, 100), 'N');
+		else
+			print_output (p_which, substr (p_buff, ((i-1)*100) + 1, 100), 'Y');
+		end if;
+	end loop;
+  END IF;
+end;
+
+--
+-- Procedure generate_invoice creates the xml for the
+-- email.
+--
+PROCEDURE generate_invoice
+( p_errbuf		OUT VARCHAR2,
+  p_retcode		OUT NUMBER,
+  p_output_type     IN VARCHAR default null,
+  p_invoice_number	IN VARCHAR2 default null,
+  p_bt_cust_acct_id in number default null,
+  p_trx_date_from 	in VARCHAR2 default null,
+  p_trx_date_to		in varchar2 default null,
+  p_resend_flag 	in varchar2 default 'N',
+  p_email_address	in varchar2 default null,
+  p_default_send_method in varchar2 default null
+) is
+	l_clob clob;
+begin
+	fnd_file.put_line (fnd_file.log, 'fnd_global.conc_request_id = '||fnd_global.conc_request_id);
+	l_clob := generate_invoice (
+		p_output_type,
+		p_invoice_number,
+		p_bt_cust_acct_id,
+		p_trx_date_from,
+		p_trx_date_to,
+		p_resend_flag,
+		p_email_address,
+		p_default_send_method
+	);
+exception
+	when others then
+		p_errbuf := sqlerrm;
+		p_retcode := 2;
+end;
+
+--
+-- Procedure generate_invoice creates the xml for the
+-- email.
+--
+FUNCTION generate_invoice
+( p_output_type     IN VARCHAR default null,
+  p_invoice_number	IN VARCHAR2 default null,
+  p_bt_cust_acct_id in number default null,
+  p_trx_date_from 	in VARCHAR2 default null,
+  p_trx_date_to		in varchar2 default null,
+  p_resend_flag 	in varchar2 default 'N',
+  p_email_address	in varchar2 default null,
+  p_default_send_method in varchar2 default null
+) return CLOB is
+  --
+  l_module VARCHAR2 (100) := g_package_name||'.'||'generate_invoice';
+  l_xml varchar2 (32000);
+  l_test_email_address varchar2 (100);
+  l_db_name varchar2 (100);
+  l_req_id number;
+  l_start_bursting boolean := false;
+  l_org_id  number := NULL;
+  l_email_address varchar2 (32000);
+  l_cc_email_address varchar2 (32000);
+  l_cc_email_names varchar2 (32000);
+  l_cc_email_boilerplate varchar2 (32000);
+  l_trx_date_from date := to_date (p_trx_date_from, 'YYYY/MM/DD HH24:MI:SS');
+  l_trx_date_to   date := to_date (p_trx_date_to, 'YYYY/MM/DD HH24:MI:SS') + 1;
+  l_po_number varchar2 (1000);
+  l_trx_number  varchar2 (20);
+
+  --l_group_trx_list varchar2 (32000);
+  l_group_trx_list clob;
+
+  cursor bt_cur is
+	select distinct
+		bill_to_customer_id,
+		customer_name,
+		account_number,
+		case when acct_email_id_list is not null then acct_email_id_list||',' else null end ||
+		case when site_email_id_list is not null then site_email_id_list||',' else null end ||
+		btc_email_id_list to_email_address,
+		case when acct_email_name_list is not null then acct_email_name_list||'<br>' else null end ||
+		case when site_email_name_list is not null then site_email_name_list||'<br>' else null end ||
+		btc_email_name_list to_email_names,
+		acct_email_id_list,
+		site_email_id_list,
+		btc_email_id_list,
+		xmlforest (cs_phone).getStringVal () cs_phone,
+		--xmlforest (listagg (trx_class||' '||trx_number, chr(10)) within group (order by trx_date) group_trx_list).getStringVal () group_trx_list,
+		count (*) num_transactions,
+		xmlforest (
+		case when count (*) = 1 then min (trx_class)||' #'||min (trx_number) else 'Invoices' end subject_line
+		).getStringVal () group_email_text,
+		xmlforest (customer_name group_customer_name, account_number group_account_number).getStringVal () group_customer_info
+	from
+		xx_ar_generate_invoice_v
+	where 1 = 1;
+
+  type inv_cur_type is ref cursor;
+  type bt_cur_type is ref cursor;
+  v_inv_cur inv_cur_type;
+  v_invoices xx_ar_generate_invoice_v%rowtype;
+  v_bt_cur bt_cur_type;
+  v_bt_rec bt_cur%rowtype;
+
+  v_sql_invoice varchar2 (32000);
+  v_sql_bill_to varchar2 (32000);
+  v_sql_group_by varchar2 (32000);
+  v_sql_where	varchar2 (32000);
+
+BEGIN
+
+  print_output (fnd_file.log, 'In generate_invoice with ');
+  print_output (fnd_file.log, '   p_output_type: '||p_output_type);
+  print_output (fnd_file.log, '   p_invoice_number: '||p_invoice_number);
+  print_output (fnd_file.log, '   p_bt_cust_acct_id: '||p_bt_cust_acct_id);
+  print_output (fnd_file.log, '   p_trx_date_from: '||l_trx_date_from);
+  print_output (fnd_file.log, '   p_trx_date_to: '||l_trx_date_to);
+  print_output (fnd_file.log, '   p_resend_flag: '||p_resend_flag);
+  print_output (fnd_file.log, '   p_email_address: '||p_email_address);
+
+  g_output_clob := null;
+
+  if (p_invoice_number is null and p_trx_date_from is null)
+  then
+    raise_application_error (-20021, 'Please enter either invoice number or transaction date from/to');
+  end if;
+
+  if (p_trx_date_from is not null and p_trx_date_to is null)
+  then
+    raise_application_error (-20022, 'Please enter either invoice number or transaction date from/to');
+  end if;
+
+  if (p_trx_date_from is not null) -- date parameters specified
+  then
+	if ((l_trx_date_to - l_trx_date_from) > 31) -- more than a month's worth of invoices being printed? do not allow
+	then
+		raise_application_error (-20023, 'Cannot print more than a month''s worth of invoices');
+	end if;
+	if ((l_trx_date_to - l_trx_date_from) <= 0) -- date range is invalid
+	then
+		raise_application_error (-20024, 'Invalid date range');
+	end if;
+  end if;
+
+  begin
+   
+	--SELECT name INTO l_db_name FROM v$database; -- Commented 08-Aug-2022 Shayeen Shaik OCI Instance name impact fix
+	 SELECT DB_NAME INTO l_db_name FROM FND_DATABASES;--  -- Added 08-Aug-2022 Shayeen Shaik OCI Instance name impact fix
+   
+
+  end;
+  print_output (fnd_file.log, '   l_db_name: '||l_db_name);
+
+  begin
+     l_org_id	     := fnd_profile.value('ORG_ID');
+  end;
+  print_output (fnd_file.log, '   l_org_id: '||l_org_id);
+
+  -- get the test email address for this instance
+  l_test_email_address := xx_ont_email_pkg.get_test_email_address;
+  print_output (fnd_file.log, '   l_test_email_address: '||l_test_email_address);
+
+  -- build the queries
+  v_sql_bill_to :=
+	'select distinct
+		bill_to_customer_id,
+		customer_name,
+		account_number,
+		case when acct_email_id_list is not null then acct_email_id_list||'','' else null end ||
+		case when site_email_id_list is not null then site_email_id_list||'','' else null end ||
+		btc_email_id_list to_email_address,
+		case when acct_email_name_list is not null then acct_email_name_list||''<br>'' else null end ||
+		case when site_email_name_list is not null then site_email_name_list||''<br>'' else null end ||
+		btc_email_name_list to_email_names,
+		acct_email_id_list,
+		site_email_id_list,
+		btc_email_id_list,
+		xmlforest (cs_phone).getStringVal () cs_phone,
+		/*
+		xmlforest (
+			listagg (trx_class||'' ''||trx_number||'' dated ''||trx_date_print||
+				 case when purchase_order is not null then '' for your purchase order ''||purchase_order else null end ||
+					 case when purchase_order is not null and purchase_order_date is not null then '' dated ''||purchase_order_date else null end,''<br/>''
+					 ) within group (order by trx_date) group_trx_list
+		).getStringVal() group_trx_list,
+		*/
+		count (*) num_transactions,
+		xmlforest (
+		case when count (*) = 1 then min (trx_class)||'' #''||min (trx_number) else ''Invoices'' end subject_line
+		).getStringVal () group_email_text,
+		xmlforest (customer_name group_customer_name, account_number group_account_number).getStringVal () group_customer_info
+	from
+		xx_ar_generate_invoice_v
+	where org_id = '||fnd_profile.value ('ORG_ID')||' ';
+  v_sql_group_by := ' group by bill_to_customer_id, customer_name, account_number, acct_email_id_list,
+	site_email_id_list, btc_email_id_list, acct_email_name_list, site_email_name_list, btc_email_name_list,cs_phone order by 1';
+
+
+  if (p_invoice_number is not null)
+  then
+	v_sql_where := v_sql_where || ' and trx_number = '''||p_invoice_number||'''';
+  end if;
+  if (l_trx_date_from is not null)
+  then
+	v_sql_where := v_sql_where || ' and trx_date >= to_date ('''||to_char (l_trx_date_from, g_date_format)||''', '''||g_date_format||''') - 31'; -- this is to prevent old invoices from printing
+	v_sql_where := v_sql_where || ' and (trx_date >= to_date ('''||to_char (l_trx_date_from, g_date_format)||''', '''||g_date_format||''')';
+
+	v_sql_where := v_sql_where || ' or   last_update_date >= to_date ('''||to_char (l_trx_date_from, g_date_format)||''', '''||g_date_format||'''))';
+
+  end if;
+  if (l_trx_date_to is not null)
+  then
+	v_sql_where := v_sql_where || ' and (trx_date < to_date ('''||to_char (l_trx_date_to, g_date_format)||''', '''||g_date_format||''')';
+
+	v_sql_where := v_sql_where || ' or   last_update_date < to_date ('''||to_char (l_trx_date_to, g_date_format)||''', '''||g_date_format||'''))';
+
+  end if;
+  if (p_bt_cust_acct_id is not null)
+  then
+	v_sql_where := v_sql_where || ' and bill_to_customer_id = '||p_bt_cust_acct_id;
+  end if;
+  if (nvl (p_resend_flag, 'N') = 'N')
+  then
+	v_sql_where := v_sql_where || ' and printing_pending = ''Y''';
+	v_sql_where := v_sql_where || ' and default_send_method = '''||p_output_type||''''; -- pick up only EMAIL and PRINT invoices if it's not a resend.
+
+  end if;
+  if (p_default_send_method is not null)
+  then
+	v_sql_where := v_sql_where || ' and default_send_method = '''||p_default_send_method||''''; -- if the default send method is specified, pick only those
+
+  end if;
+
+  print_output (fnd_file.log, 'sql for bill to is: ');
+  v_sql_bill_to := v_sql_bill_to||v_sql_where||v_sql_group_by;
+  print_output (fnd_file.log, v_sql_bill_to);
+
+  open v_bt_cur for v_sql_bill_to;
+
+  print_output (fnd_file.log, 'opened bill to cursor');
+
+  print_output (fnd_file.output, '<?xml version="1.0"?>');
+  print_output (fnd_file.output, '<bill_tos>');
+
+  loop
+	fetch v_bt_cur into v_bt_rec;
+	print_output (fnd_file.log, 'fetched row...');
+	exit when v_bt_cur%notfound;
+
+	print_output (fnd_file.log, 'processing bill to: '||v_bt_rec.customer_name||'('||v_bt_rec.account_number||')');
+
+	print_output (fnd_file.output, '<bill_to>');
+
+	for v_bt_group_rec in (
+		select xmlforest (
+				v_bt_rec.customer_name group_customer_name,
+				v_bt_rec.account_number group_account_number,
+				v_bt_rec.account_number||'-'||TO_CHAR(SYSTIMESTAMP, 'SSSSS-FF') email_group_number
+			  ).getStringVal () group_customer_info
+		from  dual)
+	loop
+		print_output (fnd_file.output, v_bt_group_rec.group_customer_info);
+	end loop;
+	--print_output (fnd_file.output, '<TIMESTAMP>'||TO_CHAR(SYSTIMESTAMP, 'SSSSS.FF')||'</TIMESTAMP>');
+	--print_output (fnd_file.output, v_bt_rec.group_trx_list);
+	print_output (fnd_file.output, v_bt_rec.cs_phone);
+	print_output (fnd_file.output, v_bt_rec.group_email_text);
+
+	-- get the email address to send invoice to
+	begin
+		select case when p_email_address is not null then p_email_address
+					when l_db_name = 'PRD1' then v_bt_rec.to_email_address
+					else l_test_email_address
+			   end to_email_address,
+			   xmlforest (v_bt_rec.to_email_address cc_email_address).getStringVal (),
+			   xmlforest (v_bt_rec.to_email_names cc_email_names).getStringVal (),
+			   xmlforest (case when v_bt_rec.to_email_names is not null then 'Invoice Contacts:' else null end cc_email_boilerplate).getStringVal ()
+		into   l_email_address,
+			   l_cc_email_address, -- this is to display who would get it, in the email. not really cc'ed.
+			   l_cc_email_names,
+			   l_cc_email_boilerplate
+		from   dual;
+	exception
+		when others then l_email_address := null;
+	end;
+
+	if (p_output_type = 'EMAIL' and l_email_address is not null)
+	then
+		begin
+			-- get the xml version of the email address
+			select xmlforest (l_email_address to_email_address).getStringVal () into l_email_address from dual;
+
+			-- place it in the output xml
+			print_output (fnd_file.output, l_email_address);
+
+			-- prepare to burst emails
+			l_start_bursting := true;
+		exception
+			when others then
+			print_output (fnd_file.log,
+				'Warning: '||
+				v_invoices.trx_class||' '||v_invoices.trx_number||
+				': No email address to send to');
+			--p_retcode := 1; -- set the warning flag
+		end;
+	end if;
+
+	print_output (fnd_file.output, l_cc_email_address);
+	if (l_cc_email_names is not null)
+	then
+		print_output (fnd_file.output, l_cc_email_names);
+		print_output (fnd_file.output, l_cc_email_boilerplate);
+	end if;
+
+	print_output (fnd_file.log, 'sql for invoice is: ');
+
+	v_sql_invoice := 'select * from xx_ar_generate_invoice_v where org_id='||fnd_profile.value ('ORG_ID')||' ';
+
+	v_sql_invoice := v_sql_invoice||v_sql_where||' and bill_to_customer_id = '||v_bt_rec.bill_to_customer_id;
+	v_sql_invoice := v_sql_invoice||' and nvl (acct_email_id_list,''!'') = nvl('''||v_bt_rec.acct_email_id_list||''',''!'')' ;
+	v_sql_invoice := v_sql_invoice||' and nvl (site_email_id_list,''!'') = nvl('''||v_bt_rec.site_email_id_list||''',''!'')' ;
+	v_sql_invoice := v_sql_invoice||' and nvl (btc_email_id_list,''!'') = nvl('''||v_bt_rec.btc_email_id_list||''',''!'')' ;
+
+	print_output (fnd_file.log, v_sql_invoice);
+
+	-- open the cursor
+	open v_inv_cur for v_sql_invoice;
+
+	print_output (fnd_file.output, '<invoices>');
+
+	l_group_trx_list := '';
+
+	-- loop through the invoices
+	loop
+
+		fetch v_inv_cur into v_invoices;
+		exit when v_inv_cur%notfound;
+
+		print_output (fnd_file.log, 'processing invoice: '||v_invoices.trx_number);
+		print_output (fnd_file.log, 'processing trx: '||v_invoices.trx1); --CRQ000000021337
+
+		--l_group_trx_list := l_group_trx_list||v_invoices.invoice_desc||'&'||'lt;br/'||'&'||'gt;';
+		l_group_trx_list := l_group_trx_list||v_invoices.invoice_desc||'<br/>';
+
+		print_output (fnd_file.log, v_invoices.xml.extract ('/header/TRX_NUMBER').getStringVal()||' email address: '||l_email_address);
+
+		print_output (fnd_file.output, '<invoice>');
+		print_output (fnd_file.output, v_invoices.xml.extract ('/header/TRX_NUMBER').getStringVal());
+		print_output (fnd_file.output, v_invoices.xml.extract ('/header/TRX_DATE').getStringVal());
+		print_output (fnd_file.output, v_invoices.xml.extract ('/header/TRX_CLASS').getStringVal());
+		print_output (fnd_file.output, v_invoices.xml.extract ('/header/WATERMARK').getStringVal());
+		--print_output (fnd_file.output, v_invoices.xml.extract ('/header/TRX1').getStringVal());
+
+		l_po_number := '';
+		begin
+			l_po_number := v_invoices.xml.extract ('/header/PURCHASE_ORDER').getStringVal ();
+		exception
+			when others then
+			null;
+		end;
+		
+		print_output (fnd_file.output, l_po_number);
+		--Start CRQ000000021337
+		l_trx_number := '';
+		begin
+			l_trx_number := v_invoices.xml.extract ('/header/TRX1').getStringVal ();
+		exception
+			when others then
+			null;
+		end;
+
+		print_output (fnd_file.output, l_trx_number);
+		print_output (fnd_file.output, v_invoices.xml.getStringVal());
+
+		--End CRQ000000021337
+		print_output (fnd_file.output, '<lines>');
+		
+		IF v_invoices.TRX_CLASS = 'Credit Memo'
+		THEN
+		for v_rec in (
+			select
+				xmlelement ("line", xmlforest (
+					trxl.customer_trx_line_id	 ,
+					trxl.line_number		 ,
+					trxl.order_line_number,
+					trxl.item_desc,
+					trxl.total_order_quantity     ,
+					trxl.shipped_quantity	      ,
+					trxl.backorder_quantity       ,
+					trxl.invoice_quantity,
+					trxl.uom_code,
+					trim (to_char (round (trxl.unit_selling_price, 4), g_unit_price_format)) unit_selling_price,
+					trim (to_char (round (trxl.extended_amount, 2), g_amount_format)) extended_amount
+				)).getStringVal () xml
+			from xx_ar_gen_invoice_lines_v2 trxl
+			where
+				trxl.customer_trx_id = v_invoices.customer_trx_id
+				and  nvl(trxl.backorder_quantity,0) <= 0
+			order by
+				trxl.line_number, trxl.order_line_number)
+				
+		loop
+			l_xml := v_rec.xml;
+			print_output (fnd_file.output, l_xml);
+		end loop;
+ELSE
+		for v_rec in (
+			select
+				xmlelement ("line", xmlforest (
+					trxl.customer_trx_line_id	 ,
+					trxl.line_number		 ,
+					trxl.order_line_number,
+					trxl.item_desc,
+					trxl.total_order_quantity     ,
+					trxl.shipped_quantity	      ,
+					trxl.backorder_quantity       ,
+					trxl.invoice_quantity,
+					trxl.uom_code,
+					trim (to_char (round (trxl.unit_selling_price, 4), g_unit_price_format)) unit_selling_price,
+					trim (to_char (round (trxl.extended_amount, 2), g_amount_format)) extended_amount
+				)).getStringVal () xml
+			from xx_ar_gen_invoice_lines_v2 trxl
+			where
+				trxl.customer_trx_id = v_invoices.customer_trx_id
+				--and nvl(trxl.backorder_quantity,0) <> nvl(trxl.total_order_quantity,0)-- Added for REQ000000200526
+				and (nvl(trxl.backorder_quantity,0) <> nvl(trxl.total_order_quantity,0) OR nvl(trxl.INVOICE_QUANTITY,0) > 0) --MODIFIED FOR INC000000186094
+			order by
+				trxl.line_number, trxl.order_line_number)
+		loop
+			l_xml := v_rec.xml;
+			print_output (fnd_file.output, l_xml);
+		end loop;
+END IF;
+		print_output (fnd_file.output, '</lines>');
+		print_output (fnd_file.output, '</invoice>');
+
+		if (fnd_global.conc_request_id > 0)
+		then
+			print_output (fnd_file.log, 'updating print flags for transaction: '||v_invoices.trx_number);
+			begin
+				update ra_customer_trx_all
+				set    printing_last_printed = sysdate, -- last print date
+					   printing_pending = 'N',
+					   printing_original_date = case when nvl (printing_count, 0) = 0 then sysdate else printing_original_date end,
+					   printing_count = nvl (printing_count, 0) + 1,
+					   last_printed_sequence_num = 1 -- this is always 1 for Uponor as there are no multi-installment invoices.
+				where  customer_trx_id = v_invoices.customer_trx_id;
+			exception
+				when others then
+				  print_output (fnd_file.log, 'ERROR: Could not update printing flags for '||v_invoices.trx_class||' '||v_invoices.trx_number);
+				  --p_retcode := 1;
+				  -- set warning flag, but keep going with other invoices.
+			end;
+		end if;
+	end loop;
+	close v_inv_cur;
+
+	print_output (fnd_file.output, '</invoices>');
+	print_output (fnd_file.log, 'about to prepare invoice list for body of email, length is '||length (l_group_trx_list));
+	print_output (fnd_file.log, l_group_trx_list);
+
+	for v_group_trx_rec in (select xmlelement ("GROUP_TRX_LIST", xmlcdata (l_group_trx_list)).getClobVal() group_trx_list from dual)
+	loop
+		print_output (fnd_file.output, v_group_trx_rec.group_trx_list);
+	end loop;
+	/*
+	print_output (fnd_file.output, '<GROUP_TRX_LIST>');
+	print_output (fnd_file.output, l_group_trx_list);
+	print_output (fnd_file.output, '</GROUP_TRX_LIST>');
+	*/
+	print_output (fnd_file.output, '</bill_to>');
+  end loop;
+
+  print_output (fnd_file.output, '</bill_tos>');
+
+  print_output (fnd_file.log, 'done with bill to cursor');
+
+  -- now submit the bursting request
+  --
+  if (l_start_bursting and fnd_global.conc_request_id > 0) then
+    print_output (fnd_file.log, 'Submitted request '||xx_ont_email_pkg.submit_bursting_request('Y'));
+  end if;
+
+  --finally,
+  commit;
+
+  return (g_output_clob);
+
+EXCEPTION
+WHEN OTHERS THEN
+  print_output (fnd_file.log, l_module || SQLERRM);
+  RAISE;
+END generate_invoice;
+
+--
+-- Procedure generate_statement creates the xml for the
+-- email.
+--
+PROCEDURE generate_statement
+( p_errbuf		OUT VARCHAR2,
+  p_retcode		OUT NUMBER,
+  p_bt_cust_acct_id in number default null,
+  p_date_from 	    in VARCHAR2 default null,
+  p_date_to		    in varchar2 default null,
+  p_resend_flag 	in varchar2 default 'N',
+  p_email_address	in varchar2 default null
+) is
+	l_clob clob;
+begin
+	fnd_file.put_line (fnd_file.log, 'fnd_global.conc_request_id = '||fnd_global.conc_request_id);
+	l_clob := generate_statement (
+				p_bt_cust_acct_id 	,
+				p_date_from 	    ,
+				p_date_to		    ,
+				p_resend_flag 		,
+				p_email_address		);
+exception
+	when others then
+		p_errbuf := sqlerrm;
+		p_retcode := 2;
+end;
+
+--
+-- Procedure generate_statement returns the xml for an AR statement
+--
+FUNCTION generate_statement
+( p_bt_cust_acct_id in number default null,
+  p_date_from 	    in VARCHAR2 default null,
+  p_date_to		    in varchar2 default null,
+  p_resend_flag 	in varchar2 default 'N',
+  p_email_address	in varchar2 default null
+) return CLOB is
+  --
+  l_module VARCHAR2 (100) := g_package_name||'.'||'generate_statement';
+  l_test_email_address varchar2 (100) := xx_ont_email_pkg.get_test_email_address;
+  l_db_name varchar2 (100);
+  l_req_id number;
+  l_start_bursting boolean := false;
+  l_org_id  number := NULL;
+  l_email_address varchar2 (32000);
+  l_cc_email_address varchar2 (32000);
+  l_cc_email_names varchar2 (32000);
+  l_cc_email_boilerplate varchar2 (32000);
+  l_date_from date := to_date (p_date_from, 'YYYY/MM/DD HH24:MI:SS');
+  l_date_to   date := to_date (p_date_to, 'YYYY/MM/DD HH24:MI:SS');
+
+  l_numrows number := 0;
+
+  --l_group_trx_list varchar2 (32000);
+  l_group_trx_list clob;
+
+  cursor bt_cur (cp_customer_id number, cp_trx_date_from date, cp_trx_date_to date) is
+	select xmlelement ("CUSTOMER",
+			xmlforest (
+				customer_id, bt_party_name, account_number, to_email_address, to_email_names, bt_addr, bt_city, bt_state, bt_postal_code,
+				email_group_number,
+				case when to_email_names is not null then 'Statements Sent To: ' else null end cc_email_boilerplate,
+				to_email_names cc_email_names
+			)).getClobVal () cust_xmlclob,
+			xmlelement ("UPONOR_ORG",
+			xmlforest (
+			org_addr, phone, fax, ar_email, ar_url
+			)).getClobVal () org_xmlclob,
+			xmlelement ("PARAMETERS",
+			xmlforest (
+				to_char (cp_trx_date_from, g_date_format) period_start_date,
+				to_char (cp_trx_date_to, g_date_format) period_end_date,
+				case when l_db_name = 'PRD1' then ' ' else 'TEST ONLY - '||l_db_name end watermark,
+				to_char (sysdate, g_date_format) statement_date,
+				'Statement for the period '||
+					to_char (cp_trx_date_from, g_date_format)|| ' to '||to_char (cp_trx_date_to, g_date_format) subject_line
+			)).getClobVal () param_xmlclob,
+			customer_id, bt_party_name, account_number, to_email_address, to_email_names
+	from (
+	select distinct
+		arps.customer_id,
+		hp.party_name bt_party_name,
+		hca.account_number,
+		case when p_email_address is not null then p_email_address
+		     when l_db_name = 'PRD1'
+		     then cust_emails.email_id_list
+			 else l_test_email_address
+		end  to_email_address,
+		hca.account_number||'-'||TO_CHAR(SYSTIMESTAMP, 'SSSSS-FF') email_group_number,
+		cust_emails.email_name_list to_email_names,
+		bt_location.bt_addr,
+		bt_location.bt_city,
+		bt_location.bt_state,
+		bt_location.bt_postal_code,
+		replace (fnd_profile.value ('XX_AR_INVOICE_ADDR'), '\n', chr(10)) org_addr,
+		fnd_profile.value ('XX_AR_INVOICE_PHONE') phone,
+		fnd_profile.value ('XX_AR_INVOICE_FAX') fax,
+		fnd_profile.value ('XX_AR_INVOICE_EMAIL') ar_email,
+		fnd_profile.value ('XX_AR_INVOICE_URL') ar_url
+	from
+		(   -- if there are invoices, payments etc in the period
+			select customer_id
+			from   ar_payment_schedules_v
+			where  1=1
+			and    customer_id = nvl (cp_customer_id, customer_id)
+			and    trx_date between cp_trx_date_from and cp_trx_date_to
+	    union all
+			-- or if there are open invoices
+			select customer_id
+			from   ar_payment_schedules_v
+			where  1=1
+			and    customer_id = nvl (cp_customer_id, customer_id)
+			and    trx_date <= cp_trx_date_to
+			and    status = 'OP'
+		) arps,
+		(
+			select
+				car.cust_account_id, xmlagg (xmlelement ("party", xmlforest (hp.party_name contact_name, hcp.email_address contact_email_address))) cust_email_info,
+				listagg (hcp.email_address, ', ') within group (order by 1) email_id_list,
+				listagg (hp.party_name||' '||hcp.email_address, '<br>') within group (order by 1) email_name_list
+			from
+				hz_cust_account_roles car,
+				hz_role_responsibility rle,
+				hz_relationships hr,
+				hz_parties hp,
+				hz_contact_points hcp
+			where 1=1
+	    --and car.cust_acct_site_id is null -- account level only
+			and rle.cust_account_role_id = car.cust_account_role_id
+			and rle.responsibility_type  = 'STMTS' -- Statements
+			and hr.party_id 	  = car.party_id
+			and hr.subject_table_name = 'HZ_PARTIES'
+			and hr.subject_type	  = 'PERSON'
+			and hp.party_id 	  = hr.subject_id
+			and hcp.contact_point_type= 'EMAIL'
+			and hcp.owner_table_name  = 'HZ_PARTIES'
+			and hcp.owner_table_id	  = car.party_id
+			and car.status = 'A'
+			and hr.status = 'A'
+			group by car.cust_account_id
+		) cust_emails,
+		hz_cust_accounts_all hca,
+		hz_parties hp,
+		(
+			select
+				hcas.cust_account_id, hcsu.location,
+				hl.address1||
+					case when hl.address2 is not null then chr(10)||hl.address2 else null end||
+					case when hl.address3 is not null then chr(10)||hl.address3 else null end
+					bt_addr,
+				hl.city bt_city,
+				hl.state bt_state,
+				hl.postal_code bt_postal_code
+			from
+				hz_cust_acct_sites_all hcas,
+				hz_cust_site_uses_all hcsu,
+				hz_party_sites hps,
+				hz_locations hl
+			where
+				hcsu.cust_acct_site_id = hcas.cust_acct_site_id
+			and hcsu.site_use_code = 'BILL_TO'
+			and hcsu.primary_flag = 'Y'
+			and hps.party_site_id = hcas.party_site_id
+			and hl.location_id = hps.location_id
+            and hcsu.status = 'A'
+            and hcas.status = 'A'
+            and hcas.org_id = fnd_profile.value ('ORG_ID')
+		) bt_location
+    where cust_emails.cust_account_id (+) = arps.customer_id
+    and   hca.cust_account_id = arps.customer_id
+    and   hp.party_id = hca.party_id
+	and   bt_location.cust_account_id (+) = hca.cust_account_id
+	and   (p_email_address is not null or cust_emails.email_id_list is not null) -- there should be email addresses setup to receive statements or one in the parameters
+	);
+
+	cursor sum_cur (cp_customer_id number, cp_trx_date_from date, cp_trx_date_to date) is
+	with sum_amounts as (
+		select al_class_meaning, sum (amount_due_original) amount
+		from   ar_payment_schedules_v
+		where  1=1
+		and    customer_id = cp_customer_id
+		and    trx_date between cp_trx_date_from and cp_trx_date_to
+		group  by al_class_meaning
+	)
+	select xmlelement ("SUMMARY_REC", xmlforest (invoice_amount, payment_amount, credit_memo_amount, chargeback_amount)).getClobVal () xmlclob
+	from (
+		select
+			to_char (nvl ((select amount from sum_amounts where al_class_meaning = 'Invoice')     , 0), g_amount_format) invoice_amount,
+			to_char (nvl ((select -1 * amount from sum_amounts where al_class_meaning = 'Payment')     , 0), g_amount_format) payment_amount,
+			to_char (nvl ((select -1 * amount from sum_amounts where al_class_meaning = 'Credit Memo') , 0), g_amount_format) credit_memo_amount,
+			to_char (nvl ((select amount from sum_amounts where al_class_meaning = 'Chargeback')  , 0), g_amount_format) chargeback_amount
+		from dual
+	)
+	;
+
+	cursor aging_lines_cur (cp_customer_id number, cp_trx_date_from date, cp_trx_date_to date) is
+	select xmlelement ("BUCKET", xmlforest (bucket_name, report_heading1, bucket_sequence_num, amount)).getClobVal () xmlclob
+	from
+	(
+		select ab.bucket_name, abl.report_heading1, abl.bucket_sequence_num, to_char (nvl (sum (arps.amount_due_remaining), 0), g_amount_format) amount
+		from   ar_payment_schedules_v arps, ar_aging_buckets ab, ar_aging_bucket_lines_vl abl
+		where  1=1
+		and    arps.customer_id (+) = cp_customer_id
+		and    arps.trx_date (+) <= cp_trx_date_to
+		and    arps.status (+) = 'OP'
+		and    arps.al_class_meaning (+) in ('Invoice', 'Chargeback', 'Credit Memo')
+		and    ab.bucket_name = 'Standard'
+		and    abl.aging_bucket_id = ab.aging_bucket_id
+		and    arps.days_past_due (+) between abl.days_start and abl.days_to
+		group  by ab.bucket_name, abl.report_heading1, abl.bucket_sequence_num
+	)
+	order by bucket_sequence_num
+	;
+
+	cursor overdue_cur (cp_customer_id number, cp_trx_date_from date, cp_trx_date_to date) is
+	select xmlelement ("OVERDUE_INVOICE",
+			xmlforest (
+				trx_number, to_char (trx_date, g_date_format) trx_date, al_class_meaning, ct_purchase_order, invoice_currency_code,
+				to_char (due_date, g_date_format) due_date,
+				to_char (amount_due_original, g_amount_format) amount_due_original,
+				to_char (amount_due_remaining, g_amount_format) amount_due_remaining,
+				days_past_due,
+				arps.rat_term_name, comments,
+				ab.bucket_sequence_num
+		   )).getClobVal () xmlclob,
+		   trx_number, trx_date
+	from   ar_payment_schedules_v arps,
+	       (
+			select abl.days_start, abl.days_to, abl.bucket_sequence_num
+			from   ar_aging_buckets ab, ar_aging_bucket_lines_vl abl
+			where  ab.bucket_name = 'Standard'
+			and    abl.aging_bucket_id = ab.aging_bucket_id
+		   ) ab
+	where  1=1
+	and    arps.customer_id = cp_customer_id
+	and    arps.trx_date < cp_trx_date_from
+	and    arps.status = 'OP'
+	and    arps.al_class_meaning in ('Invoice', 'Chargeback', 'Credit Memo')
+	--and    days_past_due > 0 -- including previous but not past due invoices as well in this list
+	and    arps.amount_due_remaining != 0
+	and    arps.days_past_due between ab.days_start and ab.days_to
+	order  by days_past_due desc, trx_date asc;
+
+	cursor invoices_cur (cp_customer_id number, cp_trx_date_from date, cp_trx_date_to date) is
+	select xmlelement ("INVOICE",
+			xmlforest (
+				trx_number, to_char (trx_date, g_date_format) trx_date, al_class_meaning, ct_purchase_order, invoice_currency_code,
+				to_char (due_date, g_date_format) due_date,
+				to_char (amount_due_original, g_amount_format) amount_due_original,
+				to_char (amount_due_remaining, g_amount_format) amount_due_remaining,
+				days_past_due, arps.rat_term_name, comments
+		   )).getClobVal () xmlclob,
+		   trx_number, trx_date
+	from   ar_payment_schedules_v arps
+	where  1=1
+	and    arps.customer_id = cp_customer_id
+	and    arps.trx_date between cp_trx_date_from and cp_trx_date_to
+	and    arps.al_class_meaning in ('Invoice', 'Chargeback', 'Credit Memo')
+	order  by trx_date;
+
+	cursor payments_cur (cp_customer_id number, cp_trx_date_from date, cp_trx_date_to date) is
+	select xmlelement ("PAYMENT_DETAIL",
+			xmlforest (arps.trx_number receipt_number, to_char (arps.trx_date, g_date_format) receipt_date, arcr.payment_method_dsp, arcr.remit_bank_name,
+				arcr.remit_bank_account, arcr.remit_bank_branch, arcr.remit_bank_currency,
+				to_char (arcr.deposit_date, g_date_format) deposit_date,
+				arps.state_dsp,
+				arps.al_class_meaning, arps.type_name, arps.ct_purchase_order, arps.invoice_currency_code,
+				to_char (arps.due_date, g_date_format) due_date, arps.comments,
+				to_char (arcr.amount, g_amount_format) amount, to_char (arcr.applied_amount, g_amount_format) applied_amount
+		   )).getClobVal () xmlclob,
+		   arps.cash_receipt_id
+	from   ar_payment_schedules_v arps, ar_cash_receipts_v arcr
+	where  1=1
+	and    arps.customer_id = cp_customer_id
+	and    arps.trx_date between cp_trx_date_from and cp_trx_date_to
+	and    arps.al_class_meaning = 'Payment'
+	and    arps.state_dsp = 'Cleared'
+	and    arcr.cash_receipt_id = arps.cash_receipt_id
+	order  by arps.cash_receipt_id
+	;
+
+	cursor payments_applied_cur (cp_cash_receipt_id number) is
+	select
+		xmlelement ("PAYMENT_APPLIED_INVOICE",
+			xmlforest (
+				trx_number		      ,
+				purchase_order,
+				to_char (amount_due_remaining, g_amount_format) amount_due_remaining	      ,
+				to_char (apply_date, g_date_format) apply_date		      ,
+				to_char (amount_applied, g_amount_format) amount_applied		      ,
+				to_char (discount, g_amount_format) discount		      ,
+				days_late		      ,
+				receipt_number
+			)
+		).getClobVal () xmlclob,
+		trx_number
+	from
+		ar_receivable_applications_v
+	where applied_flag = 'Y'
+	and cash_receipt_id   = cp_cash_receipt_id
+	order by
+		applied_flag				       ,
+		decode (applied_payment_schedule_id, - 1, 1, 0),
+		trx_number;
+
+BEGIN
+
+  print_output (fnd_file.log, 'In generate_statement with ');
+  print_output (fnd_file.log, '   p_bt_cust_acct_id: '||p_bt_cust_acct_id);
+
+  l_date_from := nvl (l_date_from, trunc (add_months (sysdate, -1), 'MM'));
+  l_date_to   := nvl (l_date_to, trunc (sysdate, 'MM') - 1); -- last day of last month if not entered
+  l_date_to   := trunc (l_date_to) + 1 - (1/(24*60*60)); -- get the last second of the last date to eliminate issues with time
+
+  print_output (fnd_file.log, '   p_date_from: '||to_char (l_date_from, 'DD-MON-YYYY HH24:MI:SS'));
+  print_output (fnd_file.log, '   p_date_to: '||to_char (l_date_to, 'DD-MON-YYYY HH24:MI:SS'));
+  print_output (fnd_file.log, '   p_resend_flag: '||p_resend_flag);
+  print_output (fnd_file.log, '   p_email_address: '||p_email_address);
+
+  if (l_date_to > add_months (l_date_from, 3))
+  then
+	raise_application_error (-20021, 'Cannot print statement for a period over 3 months');
+  end if;
+
+  if (l_date_to < l_date_from)
+  then
+	raise_application_error (-20022, 'Invalid dates');
+  end if;
+
+  g_output_clob := null;
+
+  begin
+    
+	--SELECT name INTO l_db_name FROM v$database; -- Commented 08-Aug-2022 Shayeen Shaik OCI Instance name impact fix
+	 SELECT DB_NAME INTO l_db_name FROM FND_DATABASES;--  -- Added 08-Aug-2022 Shayeen Shaik OCI Instance name impact fix
+   
+
+  end;
+  print_output (fnd_file.log, '   l_db_name: '||l_db_name);
+
+  begin
+     l_org_id	     := fnd_profile.value('ORG_ID');
+  end;
+  print_output (fnd_file.log, '   l_org_id: '||l_org_id);
+
+  print_output (fnd_file.log, '   l_test_email_address: '||l_test_email_address);
+
+  print_output (fnd_file.output, '<?xml version="1.0"?>');
+  print_output (fnd_file.output, '<bill_tos>');
+
+  for v_bt_rec in bt_cur (p_bt_cust_acct_id, l_date_from, l_date_to)
+  loop
+
+	print_output (fnd_file.log, 'processing bill to: '||v_bt_rec.bt_party_name||'('||v_bt_rec.account_number||')');
+	print_output (fnd_file.output, '<bill_to>');
+
+	print_output (fnd_file.output, '<header>');
+	print_output (fnd_file.output, v_bt_rec.cust_xmlclob);
+	print_output (fnd_file.output, v_bt_rec.org_xmlclob);
+	print_output (fnd_file.output, v_bt_rec.param_xmlclob);
+	print_output (fnd_file.output, '</header>');
+
+	print_output (fnd_file.log, 'processing summary for bill to: '||v_bt_rec.bt_party_name||'('||v_bt_rec.account_number||')');
+	print_output (fnd_file.output, '<summary>');
+	for v_summary_rec in sum_cur (v_bt_rec.customer_id, l_date_from, l_date_to)
+	loop
+		print_output (fnd_file.output, v_summary_rec.xmlclob);
+	end loop;
+	print_output (fnd_file.output, '</summary>');
+
+	print_output (fnd_file.log, 'processing aging buckets for bill to: '||v_bt_rec.bt_party_name||'('||v_bt_rec.account_number||')');
+	print_output (fnd_file.output, '<aging>');
+	for v_aging_rec in aging_lines_cur (v_bt_rec.customer_id, l_date_from, l_date_to)
+	loop
+		print_output (fnd_file.output, v_aging_rec.xmlclob);
+	end loop;
+	print_output (fnd_file.output, '</aging>');
+
+	print_output (fnd_file.log, 'processing overdues for bill to: '||v_bt_rec.bt_party_name||'('||v_bt_rec.account_number||')');
+
+	for v_overdue_rec in overdue_cur (v_bt_rec.customer_id, l_date_from, l_date_to)
+	loop
+		if (l_numrows = 0)
+		then
+			l_numrows := 1;
+			print_output (fnd_file.output, '<overdue_invoices>');
+		end if;
+		print_output (fnd_file.log, '  processing overdue rec for bill to: '||v_bt_rec.bt_party_name||'('||v_bt_rec.account_number||') '||v_overdue_rec.trx_number||'/'||v_overdue_rec.trx_date);
+		print_output (fnd_file.output, v_overdue_rec.xmlclob);
+		print_output (fnd_file.log, '  done processing overdue rec for bill to: '||v_bt_rec.bt_party_name||'('||v_bt_rec.account_number||') '||v_overdue_rec.trx_number||'/'||v_overdue_rec.trx_date);
+	end loop;
+	if l_numrows = 1
+	then
+		l_numrows := 0;
+		print_output (fnd_file.output, '</overdue_invoices>');
+	end if;
+
+	print_output (fnd_file.log, 'processing invoices for bill to: '||v_bt_rec.bt_party_name||'('||v_bt_rec.account_number||')');
+	for v_invoices_rec in invoices_cur (v_bt_rec.customer_id, l_date_from, l_date_to)
+	loop
+		if (l_numrows = 0)
+		then
+			l_numrows := 1;
+			print_output (fnd_file.output, '<invoices>');
+		end if;
+		print_output (fnd_file.log, '  processing invoice rec for bill to: '||v_bt_rec.bt_party_name||'('||v_bt_rec.account_number||') '||v_invoices_rec.trx_number||'/'||v_invoices_rec.trx_date);
+		print_output (fnd_file.output, v_invoices_rec.xmlclob);
+		print_output (fnd_file.log, '  done processing invoice rec for bill to: '||v_bt_rec.bt_party_name||'('||v_bt_rec.account_number||') '||v_invoices_rec.trx_number||'/'||v_invoices_rec.trx_date);
+	end loop;
+	if l_numrows = 1
+	then
+		l_numrows := 0;
+		print_output (fnd_file.output, '</invoices>');
+	end if;
+
+	print_output (fnd_file.log, 'processing payments for bill to: '||v_bt_rec.bt_party_name||'('||v_bt_rec.account_number||')');
+	for v_payments_rec in payments_cur (v_bt_rec.customer_id, l_date_from, l_date_to)
+	loop
+		if (l_numrows = 0)
+		then
+			l_numrows := 1;
+			print_output (fnd_file.output, '<payments>');
+		end if;
+		print_output (fnd_file.output, '<payment>');
+		print_output (fnd_file.output, v_payments_rec.xmlclob);
+		print_output (fnd_file.log, '  processing payment applications for bill to: '||v_bt_rec.bt_party_name||'('||v_bt_rec.account_number||') '||v_payments_rec.cash_receipt_id);
+
+		print_output (fnd_file.output, '<payment_applied>');
+		for v_payments_applied_rec in payments_applied_cur (v_payments_rec.cash_receipt_id)
+		loop
+			print_output (fnd_file.log, '  processing payment applications for '||v_payments_applied_rec.trx_number);
+			print_output (fnd_file.output, v_payments_applied_rec.xmlclob);
+		end loop;
+		print_output (fnd_file.output, '</payment_applied>');
+		print_output (fnd_file.output, '</payment>');
+		print_output (fnd_file.log, '  done processing payment applications for bill to: '||v_bt_rec.bt_party_name||'('||v_bt_rec.account_number||') '||v_payments_rec.cash_receipt_id);
+	end loop;
+	if l_numrows = 1
+	then
+		l_numrows := 0;
+		print_output (fnd_file.output, '</payments>');
+	end if;
+	print_output (fnd_file.log, 'done processing payments for bill to: '||v_bt_rec.bt_party_name||'('||v_bt_rec.account_number||')');
+
+	print_output (fnd_file.output, '</bill_to>');
+	print_output (fnd_file.log, 'done processing for bill to: '||v_bt_rec.bt_party_name||'('||v_bt_rec.account_number||')');
+
+	l_start_bursting := true;
+
+  end loop;
+
+  print_output (fnd_file.output, '</bill_tos>');
+
+  print_output (fnd_file.log, 'done with bill to cursor');
+
+  -- now submit the bursting request
+  --
+  if (l_start_bursting and fnd_global.conc_request_id > 0) then
+    print_output (fnd_file.log, 'Submitted request '||xx_ont_email_pkg.submit_bursting_request('Y'));
+  end if;
+
+  --finally,
+  commit;
+
+  return (g_output_clob);
+
+EXCEPTION
+WHEN OTHERS THEN
+  fnd_file.put_line (fnd_file.log, l_module || SQLERRM);
+  RAISE;
+END generate_statement;
+
+
+PROCEDURE generate_unearned_discount(p_errbuf          OUT VARCHAR2
+                                    ,p_retcode         OUT NUMBER
+                                    ,p_bt_cust_acct_id IN  NUMBER
+                                    ,p_date_from       IN  VARCHAR2
+                                    ,p_date_to         IN  VARCHAR2
+                                    ,p_email_address   IN  VARCHAR2
+                                    ,p_mode            IN  VARCHAR2   -- preview, print
+                                    ) IS
+
+   l_CLOB CLOB;
+
+
+ BEGIN 
+
+    fnd_file.put_line (fnd_file.log, 'Start Generate Unearned Discount. ');
+    fnd_file.put_line (fnd_file.log, 'Request_id: '||fnd_global.conc_request_id);
+    fnd_file.put_line (fnd_file.log, 'Bill To Cust Id: '||p_bt_cust_acct_id);
+    fnd_file.put_line (fnd_file.log, 'Date From:  '||p_date_from);
+    fnd_file.put_line (fnd_file.log, 'Date To:  '||p_date_to);
+    fnd_file.put_line (fnd_file.log, 'Email Address:  '||p_email_address);
+    fnd_file.put_line (fnd_file.log, 'Mode:  '||p_mode);
+
+
+    l_clob := generate_unearned_discount ( p_bt_cust_acct_id
+                                          ,p_date_from
+                                          ,p_date_to
+                                          ,p_email_address
+                                          ,p_mode);
+
+
+    fnd_file.put_line (fnd_file.log, 'End Generate Unearned Discount. ');
+
+
+EXCEPTION
+   WHEN OTHERS THEN 
+ 
+      p_errbuf := 'Others Error:  '||sqlerrm;
+      p_retcode := 2;
+
+END generate_unearned_discount;
+
+
+--
+-- Procedure generate_statement returns the xml  FOR an AR statement
+--
+FUNCTION generate_unearned_discount ( p_bt_cust_acct_id IN  NUMBER
+                                     ,p_date_from       IN  VARCHAR2
+                                     ,p_date_to         IN  VARCHAR2
+                                     ,p_email_address   IN  VARCHAR2
+                                     ,p_mode            IN  VARCHAR2   -- preview, print
+                                   ) RETURN CLOB IS
+
+
+  l_module               VARCHAR2(100) := g_package_name||'.'||'generate_statement';
+  l_test_email_address   VARCHAR2(100) := xx_ont_email_pkg.get_test_email_address;
+  l_db_name              VARCHAR2(100);
+  l_req_id               NUMBER;
+  l_start_bursting       BOOLEAN := FALSE;
+  l_org_id               NUMBER := NULL;
+  l_email_address        VARCHAR2 (32000);
+  l_cc_email_address     VARCHAR2 (32000);
+  l_cc_email_names       VARCHAR2 (32000);
+  l_cc_email_boilerplate VARCHAR2 (32000);
+  l_date_from            DATE := TO_DATE(p_date_from, 'YYYY/MM/DD HH24:MI:SS');
+  l_date_to              DATE := TO_DATE(p_date_to, 'YYYY/MM/DD HH24:MI:SS');
+  l_numrows              NUMBER := 0;
+  l_message              VARCHAR2(4000);
+  l_subject_line         VARCHAR2(4000); 
+  l_email_group_number   VARCHAR2(4000); 
+  l_to_email_address     VARCHAR2 (32000);
+  l_to_email_names       VARCHAR2 (32000);
+  l_group_trx_list CLOB;
+
+
+   CURSOR c_bill_to (p_customer_id NUMBER
+                    ,p_trx_date_from DATE
+                    ,p_trx_date_to DATE) IS
+      SELECT XMLELEMENT ("CUSTOMER"
+               ,XMLFOREST (customer_id
+                          ,bt_party_name
+                          ,account_number
+                          ,NVL(p_email_address,to_email_address) to_email_address
+                          ,NVL(p_email_address,to_email_names) to_email_names 
+                          ,bt_addr
+                          ,bt_city
+                          ,bt_state
+                          ,bt_postal_code
+                          ,email_group_number
+                          ,CASE 
+                              WHEN  NVL(p_email_address,to_email_names) IS NOT NULL THEN 
+                                'Letter Sent To: ' 
+                              ELSE NULL 
+                           END cc_email_boilerplate
+                          ,NVL(p_email_address,to_email_names) cc_email_names
+                          ,excl_customer
+                        )).getCLOBVal () cust_xmlCLOB
+               ,XMLELEMENT("UPONOR_ORG"
+                          ,XMLFOREST(org_addr
+                                   , phone
+                                   , fax
+                                   , ar_email
+                                   , ar_url
+                            )).getCLOBVal () org_xmlCLOB
+               ,XMLELEMENT("PARAMETERS"
+                           ,XMLFOREST(TO_CHAR(p_trx_date_from ,g_date_format) start_date
+                                     ,TO_CHAR(p_trx_date_to, g_date_format) end_date
+                                     ,CASE 
+                                         WHEN l_db_name = 'PRD1'  THEN 
+                                            ' ' 
+                                         ELSE 'TEST ONLY - '||l_db_name 
+                                      END watermark
+                                     ,TO_CHAR(SYSDATE, g_date_format) print_date
+                                     ,'Unearned Discounts for '|| TO_CHAR (p_trx_date_from, g_date_format)|| ' to '|| TO_CHAR (p_trx_date_to, g_date_format) subject_line
+                           )).getCLOBVal () param_xmlCLOB
+               ,customer_id
+               ,bt_party_name
+               ,account_number
+               ,NVL(p_email_address,to_email_address) to_email_address 
+               ,NVL(p_email_address,to_email_names)  to_email_names
+               ,CASE 
+                   WHEN   NVL(p_email_address,to_email_names)  IS NOT NULL THEN 
+                     'Letter Sent To: ' 
+                   ELSE NULL 
+                END cc_email_boilerplate
+               ,'Unearned Discounts for '|| TO_CHAR (p_trx_date_from, g_date_format)|| ' to '|| TO_CHAR (p_trx_date_to, g_date_format) subject_line
+               ,email_group_number email_group_number
+     FROM (SELECT DISTINCT
+                  arps.customer_id
+                 ,hp.party_name bt_party_name
+                 ,hca.account_number
+                 ,CASE 
+                     WHEN p_email_address IS NOT NULL THEN 
+                        p_email_address
+                     WHEN l_db_name = 'PRD1' THEN 
+                        cust_emails.email_id_list
+                     ELSE l_test_email_address
+                  END to_email_address
+                 ,hca.account_number||'-'|| TO_CHAR(SYSTIMESTAMP, 'SSSSS-FF') email_group_number
+                 ,cust_emails.email_name_list to_email_names
+                 ,bt_location.bt_addr
+                 ,bt_location.bt_city
+                 ,bt_location.bt_state
+                 ,bt_location.bt_postal_code 
+                 ,NVL((SELECT 'Y'
+                        FROM fnd_lookup_values flv
+                       WHERE flv.lookup_code = hca.account_number
+                         AND flv.lookup_type = 'XX_AR_EXCL_CUSTOMER'
+                         AND flv.enabled_flag = 'Y'),'N') excl_customer
+                 ,REPLACE(fnd_profile.value('XX_AR_INVOICE_ADDR'), '\n', CHR(10)) org_addr
+                 ,fnd_profile.value ('XX_AR_INVOICE_PHONE') phone
+                 ,fnd_profile.value ('XX_AR_INVOICE_FAX') fax
+                 ,fnd_profile.value ('XX_AR_INVOICE_EMAIL') ar_email
+                 ,fnd_profile.value ('XX_AR_INVOICE_URL') ar_url
+             FROM ( SELECT DISTINCT
+                           ct.bill_to_customer_id customer_id
+                      FROM ra_terms t
+                          ,ra_customer_trx_all ct
+                          ,ar_payment_schedules_all ps
+                          ,ra_terms_lines_discounts tld
+                          ,hz_cust_accounts ca
+                     WHERE t.term_id = ct.term_id
+                       AND ct.bill_to_customer_id = NVL(p_customer_id,ct.bill_to_customer_id)
+                       AND ct.trx_date BETWEEN NVL(p_trx_date_from,ct.trx_date) AND NVL(p_trx_date_to,SYSDATE)    
+                       AND ct.org_id = fnd_profile.value('ORG_ID') 
+                       -- exclude select customers when printing
+                       AND (p_mode = 'PREVIEW'
+                           OR (p_mode = 'PRINT' 
+                               AND NOT EXISTS (SELECT 'X'
+                                                 FROM fnd_lookup_values flv
+                                                WHERE lookup_type = 'XX_AR_EXCL_CUSTOMER'
+                                                  AND lookup_code = ca.account_number
+                                                  AND flv.enabled_flag = 'Y')))  
+                       AND ct.bill_to_customer_id = ca.cust_account_id    
+                       AND ct.customer_trx_id = ps.customer_trx_id
+                       AND t.end_date_active is null
+                       AND ps.status = 'OP'
+                       AND ps.amount_due_remaining > 0
+                       AND (ps.amount_due_remaining / ps.amount_due_original) <= (tld.discount_percent/100)
+                       AND NVL(ps.discount_taken_earned,0) = 0
+                       AND t.term_id = tld.term_id
+                       AND CASE
+                              WHEN tld.discount_days IS NOT NULL THEN
+                                 ct.trx_date + tld.discount_days 
+                              WHEN tld.discount_day_of_month IS NOT NULL 
+                                 AND TO_CHAR(SYSDATE,'DD') >= '25' THEN
+                                    --cutoff date of the 25th   
+                                    TO_DATE(tld.discount_day_of_month||TO_CHAR(add_months(ct.trx_date,tld.discount_months_forward + 1),'-MON-YYYY'),'DD-MON-YYYY') 
+                              WHEN tld.discount_day_of_month IS NOT NULL 
+                                 AND TO_CHAR(SYSDATE,'DD') < '25' THEN
+                                    TO_DATE(tld.discount_day_of_month||TO_CHAR(add_months(ct.trx_date,tld.discount_months_forward),'-MON-YYYY'),'DD-MON-YYYY') 
+                              ELSE
+                                 NULL
+                              END < SYSDATE
+                  ) arps
+                 ,(SELECT car.cust_account_id
+                        , XMLAGG (XMLELEMENT("party"
+                                    ,XMLFOREST (hp.party_name contact_name
+                                              , hcp.email_address contact_email_address))) cust_email_info
+                                    ,LISTAGG(hcp.email_address, ', ') WITHIN GROUP (ORDER BY 1) email_id_list
+                                    ,LISTAGG(hp.party_name||' '||hcp.email_address, '<br>') WITHIN GROUP (ORDER BY 1) email_name_list
+                    FROM hz_cust_account_roles car
+                        ,hz_role_responsibility rle
+                        ,hz_relationships hr
+                        ,hz_parties hp
+                        ,hz_contact_points hcp
+                   WHERE 1=1
+                     AND rle.cust_account_role_id = car.cust_account_role_id 
+                     -- djm verify this
+                     AND rle.responsibility_type  = 'STMTS' -- Statements
+                     AND hr.party_id   = car.party_id
+                     AND hr.subject_table_name = 'HZ_PARTIES'
+                     AND hr.subject_type  = 'PERSON'
+                     AND hp.party_id   = hr.subject_id
+                     AND hcp.contact_point_type= 'EMAIL'
+                     AND hcp.owner_table_name  = 'HZ_PARTIES'
+                     AND hcp.owner_table_id  = car.party_id
+                     AND car.status = 'A'
+                     AND hr.status = 'A'
+                   GROUP BY car.cust_account_id
+                  ) cust_emails
+                ,hz_cust_accounts_all hca
+                ,hz_parties hp
+                ,(SELECT hcas.cust_account_id
+                        ,hcsu.location
+                        ,hl.address1||CASE 
+                                         WHEN  hl.address2 IS NOT NULL THEN 
+                                            CHR(10)||hl.address2 
+                                         ELSE NULL 
+                                         END
+                                    ||CASE 
+                                         WHEN hl.address3 IS NOT NULL THEN 
+                                            CHR(10)||hl.address3 
+                                         ELSE NULL 
+                                         END bt_addr
+                        ,hl.city bt_city
+                        ,hl.state bt_state
+                        ,hl.postal_code bt_postal_code
+                    FROM hz_cust_acct_sites_all hcas
+                        ,hz_cust_site_uses_all hcsu
+                        ,hz_party_sites hps
+                        ,hz_locations hl
+                   WHERE hcsu.cust_acct_site_id = hcas.cust_acct_site_id
+                     AND hcsu.site_use_code = 'BILL_TO'
+                     AND hcsu.primary_flag = 'Y'
+                     AND hps.party_site_id = hcas.party_site_id
+                     AND hl.location_id = hps.location_id
+                     AND hcsu.status = 'A'
+                     AND hcas.status = 'A'
+                     AND hcas.org_id = fnd_profile.value ('ORG_ID')
+                 ) bt_location
+            WHERE cust_emails.cust_account_id (+) = arps.customer_id
+              AND hca.cust_account_id = arps.customer_id
+              AND hp.party_id = hca.party_id
+              AND bt_location.cust_account_id (+) = hca.cust_account_id
+              AND (p_email_address IS NOT NULL 
+                 OR cust_emails.email_id_list IS NOT NULL) 
+         );
+
+
+   CURSOR c_totals (p_customer_id   NUMBER
+                   ,p_trx_date_from DATE
+                   ,p_trx_date_to   DATE) IS
+       SELECT XMLELEMENT ("SUMMARY_REC", XMLFOREST(invoice_amount
+                                                  ,payment_amount
+                                                  ,amount_due_remaining)).getCLOBVal () xmlCLOB
+         FROM( SELECT ct.bill_to_customer_id custoemr_id
+                     ,TO_CHAR(SUM(ps.amount_due_original),g_amount_format) invoice_amount
+                     ,TO_CHAR(SUM(ps.amount_due_remaining),g_amount_format) amount_due_remaining
+                     ,TO_CHAR(SUM(NVL(ps.amount_due_original - amount_due_remaining,0)),g_amount_format) payment_amount    
+                 FROM ra_terms t
+                     ,ra_customer_trx_all ct
+                     ,ar_payment_schedules_all ps
+                     ,ra_terms_lines_discounts tld
+                     ,hz_cust_accounts ca
+                WHERE t.term_id = ct.term_id
+                  AND ct.bill_to_customer_id = NVL(p_customer_id,ct.bill_to_customer_id)
+                  AND ct.trx_date BETWEEN NVL(p_trx_date_from,ct.trx_date) AND NVL(p_trx_date_to,SYSDATE)    
+                  AND ct.org_id = fnd_profile.value('ORG_ID') 
+                  AND ct.bill_to_customer_id = ca.cust_account_id    
+                  AND ct.customer_trx_id = ps.customer_trx_id
+                  AND t.end_date_active IS NULL 
+                  AND ps.status = 'OP'
+                  AND ps.amount_due_remaining > 0
+                  AND (ps.amount_due_remaining / ps.amount_due_original) <= (tld.discount_percent/100)
+                  AND NVL(ps.discount_taken_earned,0) = 0
+                  AND t.term_id = tld.term_id
+                  -- exclude select customers 
+                  AND (p_mode = 'PREVIEW'
+                      OR (p_mode = 'PRINT' 
+                         AND NOT EXISTS (SELECT 'X'
+                                           FROM fnd_lookup_values flv
+                                          WHERE lookup_type = 'XX_AR_EXCL_CUSTOMER'
+                                            AND lookup_code = ca.account_number
+                                            AND flv.enabled_flag = 'Y')))  
+                  AND CASE
+                         WHEN tld.discount_days IS NOT NULL THEN
+                            ct.trx_date + tld.discount_days 
+                         WHEN tld.discount_day_of_month IS NOT NULL 
+                            AND TO_CHAR(SYSDATE,'DD') >= '25' THEN
+                               --cutoff date of the 25th   
+                               TO_DATE(tld.discount_day_of_month||TO_CHAR(add_months(ct.trx_date,tld.discount_months_forward + 1),'-MON-YYYY'),'DD-MON-YYYY') 
+                         WHEN tld.discount_day_of_month IS NOT NULL 
+                            AND TO_CHAR(SYSDATE,'DD') < '25' THEN
+                               TO_DATE(tld.discount_day_of_month||TO_CHAR(add_months(ct.trx_date,tld.discount_months_forward),'-MON-YYYY'),'DD-MON-YYYY') 
+                         ELSE
+                            NULL
+                         END < SYSDATE
+                GROUP BY ct.bill_to_customer_id); 
+
+
+
+
+   CURSOR c_inv_details (p_customer_id NUMBER
+                        ,p_trx_date_from DATE
+                        ,p_trx_date_to DATE) IS
+      SELECT XMLELEMENT ("DETAILS"
+                         ,XMLFOREST (trx_number
+                                    ,TO_CHAR(trx_date, g_date_format) trx_date
+                                    ,invoice_currency_code
+                                    ,TO_CHAR(discount_date, g_date_format) discount_date
+                                    ,TO_CHAR (amount_due_original, g_amount_format) amount_due_original
+                                    ,TO_CHAR (amount_due_remaining, g_amount_format) amount_due_remaining
+                                    ,terms
+                           )).getCLOBVal () xmlCLOB
+                         ,trx_number
+                         ,trx_date
+         FROM( SELECT t.name
+                     ,ct.bill_to_customer_id custoemr_id
+                     ,ca.account_number   
+                     ,INITCAP(t.description) terms
+                     ,ps.amount_due_remaining
+                     ,ps.amount_due_original
+                     ,ps.discount_taken_earned
+                     ,ps.discount_taken_unearned
+                     ,ct.trx_number
+                     ,ct.trx_date
+                     ,ps.due_date
+                     ,tld.discount_days
+                     ,tld.discount_day_of_month
+                     ,tld.discount_months_forward
+                     ,tld.discount_percent
+                     ,ps.invoice_currency_code 
+                     ,CASE 
+                         WHEN tld.discount_days IS NOT NULL THEN
+                            ct.trx_date + tld.discount_days 
+                         WHEN tld.discount_day_of_month IS NOT NULL 
+                            AND TO_CHAR(SYSDATE,'DD') >= '25' THEN
+                            --cutoff date of the 25th   
+                            TO_DATE(tld.discount_day_of_month||TO_CHAR(add_months(ct.trx_date,tld.discount_months_forward + 1),'-MON-YYYY'),'DD-MON-YYYY') 
+                         WHEN tld.discount_day_of_month IS NOT NULL 
+                            AND TO_CHAR(SYSDATE,'DD') < '25' THEN
+                            TO_DATE(tld.discount_day_of_month||TO_CHAR(add_months(ct.trx_date,tld.discount_months_forward),'-MON-YYYY'),'DD-MON-YYYY') 
+                         ELSE
+                            NULL
+                         END discount_date
+                 FROM ra_terms t
+                     ,ra_customer_trx_all ct
+                     ,ar_payment_schedules_all ps
+                     ,ra_terms_lines_discounts tld
+                     ,hz_cust_accounts ca
+                WHERE t.term_id = ct.term_id
+                  AND ct.bill_to_customer_id = NVL(p_customer_id,ct.bill_to_customer_id)
+                  AND ct.trx_date BETWEEN NVL(p_trx_date_from,ct.trx_date) AND NVL(p_trx_date_to,SYSDATE)    
+                  AND ct.org_id = fnd_profile.value('ORG_ID') 
+                  AND ct.bill_to_customer_id = ca.cust_account_id    
+                  AND ct.customer_trx_id = ps.customer_trx_id
+                  AND t.end_date_active IS NULL 
+                  AND ps.status = 'OP'
+                  AND ps.amount_due_remaining > 0
+                  AND (ps.amount_due_remaining / ps.amount_due_original) <= (tld.discount_percent/100)
+                  AND NVL(ps.discount_taken_earned,0) = 0
+                  AND t.term_id = tld.term_id
+                  -- exclude select customers 
+                  AND (p_mode = 'PREVIEW'
+                      OR (p_mode = 'PRINT' 
+                         AND NOT EXISTS (SELECT 'X'
+                                           FROM fnd_lookup_values flv
+                                          WHERE lookup_type = 'XX_AR_EXCL_CUSTOMER'
+                                            AND lookup_code = ca.account_number
+                                            AND flv.enabled_flag = 'Y')))  
+                  AND CASE
+                         WHEN tld.discount_days IS NOT NULL THEN
+                            ct.trx_date + tld.discount_days 
+                         WHEN tld.discount_day_of_month IS NOT NULL 
+                            AND TO_CHAR(SYSDATE,'DD') >= '25' THEN
+                               --cutoff date of the 25th   
+                               TO_DATE(tld.discount_day_of_month||TO_CHAR(add_months(ct.trx_date,tld.discount_months_forward + 1),'-MON-YYYY'),'DD-MON-YYYY') 
+                         WHEN tld.discount_day_of_month IS NOT NULL 
+                            AND TO_CHAR(SYSDATE,'DD') < '25' THEN
+                               TO_DATE(tld.discount_day_of_month||TO_CHAR(add_months(ct.trx_date,tld.discount_months_forward),'-MON-YYYY'),'DD-MON-YYYY') 
+                         ELSE
+                            NULL
+                         END < SYSDATE
+                ORDER BY ct.trx_date); 
+
+   CURSOR c_instance IS
+      SELECT DB_NAME 
+        FROM FND_DATABASES; 
+
+
+BEGIN
+
+   print_output (fnd_file.log, 'Start generate_unearned_discount. ');
+   print_output (fnd_file.log, '   p_bt_cust_acct_id: '||p_bt_cust_acct_id);
+
+   l_date_from := NVL(l_date_from, TRUNC(add_months (SYSDATE, -1), 'MM'));
+   l_date_to   := NVL(l_date_to, TRUNC(SYSDATE, 'MM') - 1); -- last day of last month  IF not entered
+   l_date_to   := TRUNC(l_date_to) + 1 - (1/(24*60*60)); -- get the last second of the last DATE to eliminate issues with time
+   l_org_id    := fnd_profile.value('ORG_ID');
+
+   print_output (fnd_file.log, '   p_date_from: '|| TO_CHAR (l_date_from, 'DD-MON-YYYY HH24:MI:SS'));
+   print_output (fnd_file.log, '   p_date_to: '|| TO_CHAR (l_date_to, 'DD-MON-YYYY HH24:MI:SS'));
+   print_output (fnd_file.log, '   p_email_address: '||p_email_address);
+
+
+   IF (l_date_to < l_date_from) THEN
+      l_message:= 'Invalid Dates';
+   END IF;
+
+   g_output_CLOB := NULL;
+
+    OPEN c_instance;
+   FETCH c_instance INTO l_db_name;
+   CLOSE c_instance;
+
+
+   print_output (fnd_file.log, '   l_db_name: '||l_db_name);
+
+  
+   print_output (fnd_file.log, '   l_org_id: '||l_org_id);
+   print_output (fnd_file.log, '   l_test_email_address: '||l_test_email_address);
+   print_output (fnd_file.output, '<?xml version="1.0"?>');
+   print_output (fnd_file.output, '<bill_tos>');
+
+
+   FOR c_bt_rec IN c_bill_to (p_bt_cust_acct_id
+                            , l_date_from
+                            , l_date_to) LOOP
+
+      print_output(fnd_file.log, 'processing bill to: '||c_bt_rec.bt_party_name||'('||c_bt_rec.account_number||')');
+      print_output(fnd_file.output, '<bill_to>');
+
+      print_output(fnd_file.log, 'to_email_address: '||c_bt_rec.to_email_address);
+      print_output(fnd_file.log, 'to_email_names: '||c_bt_rec.to_email_names);
+      print_output(fnd_file.log, 'cc_email_boilerplate: '||c_bt_rec.cc_email_boilerplate);
+      print_output(fnd_file.log, 'subject_line: '||c_bt_rec.subject_line);
+      print_output(fnd_file.log, 'email_group_number: '||c_bt_rec.email_group_number);
+
+      SELECT xmlforest (c_bt_rec.to_email_address to_email_address).getStringVal () 
+            ,xmlforest (c_bt_rec.to_email_names  to_email_names).getStringVal () 
+            ,xmlforest (c_bt_rec.to_email_names  cc_email_names).getStringVal () 
+            ,xmlforest (c_bt_rec.cc_email_boilerplate cc_email_boilerplate).getStringVal () 
+            ,xmlforest (c_bt_rec.subject_line subject_line).getStringVal () 
+            ,xmlforest (c_bt_rec.email_group_number email_group_number).getStringVal () 
+        INTO l_to_email_address
+            ,l_to_email_names
+            ,l_cc_email_names  
+            ,l_cc_email_boilerplate 
+            ,l_subject_line     
+            ,l_email_group_number
+        FROM dual;  
+
+      print_output(fnd_file.output, l_to_email_address);
+      print_output(fnd_file.output, l_to_email_names);
+      print_output(fnd_file.output, l_cc_email_names);
+      print_output(fnd_file.output, l_cc_email_boilerplate);
+      print_output(fnd_file.output, l_subject_line);
+      print_output(fnd_file.output, l_email_group_number);
+
+
+      print_output(fnd_file.output, '<header>');
+      print_output(fnd_file.output, c_bt_rec.cust_xmlCLOB);
+      print_output(fnd_file.output, c_bt_rec.org_xmlCLOB);
+      print_output(fnd_file.output, c_bt_rec.param_xmlCLOB);
+      print_output(fnd_file.output, '</header>');
+
+      print_output(fnd_file.log, 'processing summary  FOR bill to: '||c_bt_rec.bt_party_name||'('||c_bt_rec.account_number||')');
+      print_output(fnd_file.output, '<summary>');
+
+
+      print_output(fnd_file.log, ' ');
+      print_output(fnd_file.log, '**************');
+      print_output(fnd_file.log, ' ');
+
+--      print_output(fnd_file.log, 'to_email_address: '||c_bt_rec.to_email_address);
+--      print_output(fnd_file.log, 'to_email_names: '||c_bt_rec.to_email_names);
+--      print_output(fnd_file.log, 'cc_email_boilerplate: '||c_bt_rec.cc_email_boilerplate);
+--      print_output(fnd_file.log, 'subject_line: '||c_bt_rec.subject_line);
+--      print_output(fnd_file.log, 'email_group_number: '||c_bt_rec.email_group_number);
+
+      print_output(fnd_file.log, ' ');
+      print_output(fnd_file.log, '**************');
+      print_output(fnd_file.log, ' ');
+
+
+      FOR l_totals_rec in c_totals (c_bt_rec.customer_id
+                                  , l_date_from
+                                  , l_date_to)  LOOP
+
+         print_output (fnd_file.output, l_totals_rec.xmlCLOB);
+
+      END LOOP;
+
+      print_output (fnd_file.output, '</summary>');
+
+      print_output (fnd_file.log, 'processing overdues  FOR bill to: '||c_bt_rec.bt_party_name||'('||c_bt_rec.account_number||')');
+
+      FOR c_inv_details_rec in c_inv_details (c_bt_rec.customer_id
+                                            , l_date_from
+                                            , l_date_to)  LOOP
+
+         IF (l_numrows = 0) THEN
+       
+            l_numrows := 1;
+            print_output (fnd_file.output, '<invoice_detail>');
+
+         END IF;
+
+         print_output (fnd_file.log, '  processing invoice detail  FOR bill to: '||c_bt_rec.bt_party_name||'('||c_bt_rec.account_NUMBER||') '||c_inv_details_rec.trx_NUMBER||'/'||c_inv_details_rec.trx_date);
+         print_output (fnd_file.output, c_inv_details_rec.xmlCLOB);
+         print_output (fnd_file.log, '  done processing invoice detail rec  FOR bill to: '||c_bt_rec.bt_party_name||'('||c_bt_rec.account_NUMBER||') '||c_inv_details_rec.trx_NUMBER||'/'||c_inv_details_rec.trx_date);
+
+      END LOOP;
+
+      IF l_numrows = 1 THEN
+         l_numrows := 0;
+         print_output (fnd_file.output, '</invoice_detail>');
+      END IF;
+
+      print_output (fnd_file.output, '</bill_to>');
+      print_output (fnd_file.log, 'done processing  FOR bill to: '||c_bt_rec.bt_party_name||'('||c_bt_rec.account_NUMBER||')');
+
+      -- may need to disable
+      IF p_mode = 'PRINT' THEN 
+        l_start_bursting := true;
+      END IF;
+
+   END  LOOP;
+
+   print_output (fnd_file.output, '</bill_tos>');
+   print_output (fnd_file.log, 'done with bill to CURSOR');
+
+   -- now submit the bursting request
+   --
+   IF (l_start_bursting AND fnd_global.conc_request_id > 0)  THEN
+      print_output (fnd_file.log, 'Submitted request '||xx_ont_email_pkg.submit_bursting_request('Y'));
+   END  IF;
+
+   COMMIT;
+
+   RETURN(g_output_CLOB);
+
+EXCEPTION
+   WHEN FND_API.G_EXC_ERROR THEN 
+
+      fnd_file.put_line (fnd_file.log, l_module || l_message);
+      RAISE;
+
+   WHEN OTHERS THEN 
+
+      fnd_file.put_line (fnd_file.log, l_module || SQLERRM);
+      RAISE;
+
+END generate_unearned_discount;
+END xx_ar_email_pkg;
+/
+show errors
+/
+exit
